@@ -50,7 +50,7 @@ export function parseStreamKey(
         throw new Error(`Invalid stream key type: ${type}`);
     }
 
-    if ((type === "guild" && streamKeyArray.length < 4) || (type === "call" && streamKey.length < 3)) 
+    if ((type === "guild" && streamKeyArray.length < 3) || (type === "call" && streamKey.length < 2)) 
         throw new Error(`Invalid stream key: ${streamKey}`); // invalid stream key
    
     let guildId: string | null = null;
