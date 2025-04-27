@@ -1,7 +1,7 @@
 import sp from "sodium-plus";
 import { max_int32bit } from "../../utils.js";
 const { SodiumPlus } = sp;
-
+import crypto from 'crypto';
 export interface TransportEncryptor {
     encrypt(plaintext: Buffer, additionalData: Buffer): Promise<[Buffer, Buffer]>
 }
