@@ -2,9 +2,9 @@ import ffmpeg from 'fluent-ffmpeg';
 import pDebounce from 'p-debounce';
 import sharp from 'sharp';
 import Log from 'debug-level';
-import { demux } from './LibavDemuxer.js';
-import { setTimeout as delay } from 'node:timers/promises';
+import * as zmq from "zeromq";
 import { PassThrough, type Readable } from "node:stream";
+import { demux } from './LibavDemuxer.js';
 import { VideoStream } from './VideoStream.js';
 import { AudioStream } from './AudioStream.js';
 import { isFiniteNonZero } from '../utils.js';
@@ -14,12 +14,6 @@ import { createDecoder } from './LibavDecoder.js';
 import LibAV from '@lng2004/libav.js-variant-webcodecs-avf-with-decoders';
 import type { SupportedVideoCodec } from '../utils.js';
 import type { MediaUdp, Streamer } from '../client/index.js';
-
-export interface Controller {
-    mute(): void;
-    unmute(): void;
-    isMuted(): boolean;
-}
 
 export type EncoderOptions = {
     /**
@@ -99,6 +93,11 @@ export type EncoderOptions = {
      */
     customFfmpegFlags: string[]
 }
+
+export type Controller = {
+    volume: number,
+    setVolume(newVolume: number): Promise<boolean>
+};
 
 export function prepareStream(
     input: string | Readable,
@@ -304,11 +303,24 @@ export function prepareStream(
             .addOutputOption("-lfe_mix_level 1")
             .audioFrequency(48000)
             .audioCodec("libopus")
-            .audioBitrate(`${bitrateAudio}k`);
+            .audioBitrate(`${bitrateAudio}k`)
+            .audioFilters("volume@internal_lib=1.0")
 
     // Add custom ffmpeg flags
     if (mergedOptions.customFfmpegFlags && mergedOptions.customFfmpegFlags.length > 0) {
         command.addOptions(mergedOptions.customFfmpegFlags);
+    }
+
+    // realtime control mechanism
+    const zmqAudio = "tcp://localhost:42069";
+    const zmqAudioClient = new zmq.Request({ sendTimeout: 5000, receiveTimeout: 5000 });
+
+    if (includeAudio)
+    {
+        command.audioFilters(`azmq=b=${zmqAudio.replaceAll(":","\\\\:")}`)
+        output.once("data", () => {
+            zmqAudioClient.connect(zmqAudio);
+        });
     }
 
     // exit handling
@@ -330,7 +342,35 @@ export function prepareStream(
     cancelSignal?.addEventListener("abort", () => command.kill("SIGTERM"), { once: true });
     command.run();
 
-    return { command, output, promise }
+    let currentVolume = 1;
+    return {
+        command,
+        output,
+        promise,
+        controller: {
+            get volume() {
+                return currentVolume;
+            },
+            async setVolume(newVolume: number)
+            {
+                if (newVolume < 0)
+                    return false;
+                try
+                {
+                    await zmqAudioClient.send(`volume@internal_lib volume ${newVolume}`);
+                    const [res] = await zmqAudioClient.receive();
+                    if (res.toString("utf-8") !== "0 Error number 0 occurred")
+                        return false;
+                    currentVolume = newVolume;
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+        } satisfies Controller
+    }
 }
 
 export type PlayStreamOptions = {
@@ -466,12 +506,9 @@ export async function playStream(
 
     const vStream = new VideoStream(udp);
     video.stream.pipe(vStream);
-
-    let aStream: AudioStream | undefined; // Declare the audio stream instance
-
     if (audio)
     {
-        aStream = new AudioStream(udp);
+        const aStream = new AudioStream(udp);
         audio.stream.pipe(aStream);
         vStream.syncStream = aStream;
         aStream.syncStream = vStream;
@@ -484,10 +521,8 @@ export async function playStream(
             const stopBurst = (pts: number) => {
                 if (pts < burstTime * 1000)
                     return;
-                // biome-ignore lint/style/noNonNullAssertion:
-                vStream.sync = aStream!.sync = true;
-                // biome-ignore lint/style/noNonNullAssertion:
-                vStream.noSleep = vStream!.sync = false;
+                vStream.sync = aStream.sync = true;
+                vStream.noSleep = aStream.noSleep = false;
                 vStream.off("pts", stopBurst);
             }
             vStream.on("pts", stopBurst);
@@ -535,8 +570,7 @@ export async function playStream(
             cleanupFuncs.push(() => video.stream.off("data", updatePreview));
         })();
     }
-
-    const streamPromise = new Promise<void>((resolve, reject) => {
+    return new Promise<void>((resolve, reject) => {
         cleanupFuncs.push(() => {
             stopStream();
             udp.mediaConnection.setSpeaking(false);
@@ -561,20 +595,4 @@ export async function playStream(
             resolve();
         });
     }).catch(() => {});
-
-    // Return the promise and the controller
-    return {
-        controller: {
-            mute() {
-                aStream?.mute();
-            },
-            unmute() {
-                aStream?.unmute();
-            },
-            isMuted() {
-                return !!aStream?.isMuted();
-            }
-        } satisfies Controller,
-        done: streamPromise
-    };
 }
