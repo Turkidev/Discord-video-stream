@@ -6,7 +6,7 @@ import type { Packet } from "@lng2004/libav.js-variant-webcodecs-avf-with-decode
 
 export class BaseMediaStream extends Writable {
     private _pts?: number;
-    private _syncTolerance = 5;
+    private _syncTolerance = 20;
     private _loggerSend: Log;
     private _loggerSync: Log;
     private _loggerSleep: Log;
@@ -15,8 +15,8 @@ export class BaseMediaStream extends Writable {
     private _startTime?: number;
     private _startPts?: number;
     private _sync = true;
+    private _syncStream?: BaseMediaStream;
 
-    public syncStream?: BaseMediaStream;
     constructor(type: string, noSleep = false) {
         super({ objectMode: true, highWaterMark: 0 });
         this._loggerSend = new Log(`stream:${type}:send`);
@@ -35,13 +35,22 @@ export class BaseMediaStream extends Writable {
         else
             this._loggerSync.debug("Sync disabled");
     }
+    get syncStream() {
+        return this._syncStream;
+    }
+    set syncStream(stream: BaseMediaStream | undefined)
+    {
+        if (stream !== undefined && this === stream.syncStream)
+            throw new Error("Cannot sync 2 streams with eachother");
+        this._syncStream = stream;
+    }
     get noSleep(): boolean {
         return this._noSleep;
     }
     set noSleep(val: boolean) {
         this._noSleep = val;
         if (!val)
-            this._startPts = this._startTime = undefined;
+            this.resetTimingCompensation();
     }
     get pts(): number | undefined {
         return this._pts;
@@ -54,34 +63,27 @@ export class BaseMediaStream extends Writable {
             return;
         this._syncTolerance = n;
     }
-    protected async _waitForOtherStream()
-    {
-        let i = 0;
-        while (
-            this.sync && this.syncStream &&
-            !this.syncStream.writableEnded &&
-            this.syncStream.pts !== undefined &&
-            this._pts !== undefined &&
-            this._pts - this.syncStream.pts > this._syncTolerance
-        )
-        {
-            if (i === 0)
-            {
-                this._loggerSync.debug(
-                    `Waiting for other stream (${this._pts} - ${this.syncStream._pts} > ${this._syncTolerance})`,
-                );
-            }
-            await setTimeout(1);
-            i = (i + 1) % 10;
-        }
-    }
     protected async _sendFrame(frame: Buffer, frametime: number): Promise<void>
     {
         throw new Error("Not implemented");
     }
+    private ptsDelta() {
+        if (this.pts !== undefined && this.syncStream?.pts !== undefined)
+            return this.pts - this.syncStream.pts;
+        return undefined;
+    }
+    private isAhead() {
+        const delta = this.ptsDelta();
+        return this.syncStream?.writableEnded === false && delta !== undefined && delta > this.syncTolerance;
+    }
+    private isBehind() {
+        const delta = this.ptsDelta();
+        return this.syncStream?.writableEnded === false && delta !== undefined && delta < -this.syncTolerance;
+    }
+    private resetTimingCompensation() {
+        this._startTime = this._startPts = undefined;
+    }
     async _write(frame: Packet, _: BufferEncoding, callback: (error?: Error | null) => void) {
-        await this._waitForOtherStream();
-
         const { data, ptshi, pts, durationhi, duration, time_base_num, time_base_den } = frame;
         // biome-ignore lint/style/noNonNullAssertion: this will never happen with our media stream
         const frametime = combineLoHi(durationhi!, duration!) / time_base_den! * time_base_num! * 1000;
@@ -120,6 +122,34 @@ export class BaseMediaStream extends Writable {
         );
         if (this._noSleep || sleep === 0)
         {
+            callback(null);
+        }
+        else if (this.sync && this.isBehind())
+        {
+            this._loggerSync.debug({
+                stats: {
+                    pts: this.pts,
+                    pts_other: this.syncStream?.pts
+                }
+            }, "Stream is behind. Not sleeping for this frame");
+            this.resetTimingCompensation();
+            callback(null);
+        }
+        else if (this.sync && this.isAhead())
+        {
+            do
+            {
+                this._loggerSync.debug({
+                    stats: {
+                        pts: this.pts,
+                        pts_other: this.syncStream?.pts,
+                        frametime
+                    }
+                }, `Stream is ahead. Waiting for ${frametime}ms`);
+                await setTimeout(frametime);
+            }
+            while (this.sync && this.isAhead());
+            this.resetTimingCompensation();
             callback(null);
         }
         else
