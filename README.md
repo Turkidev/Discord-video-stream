@@ -63,9 +63,10 @@ Extensions supported by Discord (taken from the webrtc sdp exchange)
 
 ## Requirements
 
-Ffmpeg is required for the usage of this package. If you are on linux you can easily install ffmpeg from your distribution's package manager.
-
-If you are on Windows, you can download it from the official ffmpeg website: https://ffmpeg.org/download.html
+For full functionality, this library requires an FFmpeg build with `libzmq` enabled. Here is our recommendation:
+- Windows & Linux: [BtbN's FFmpeg Builds](https://github.com/BtbN/FFmpeg-Builds)
+- macOS (Intel): [evermeet.cx](https://evermeet.cx/ffmpeg/)
+- macOS (Apple Silicon): Install from Homebrew
 
 ## Usage
 
