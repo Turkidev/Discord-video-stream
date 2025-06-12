@@ -10,18 +10,24 @@ export class BaseMediaStream extends Writable {
     private _loggerSend: Log;
     private _loggerSync: Log;
     private _loggerSleep: Log;
+    private _loggerPause: Log;
 
     private _noSleep: boolean;
     private _startTime?: number;
     private _startPts?: number;
     private _sync = true;
     private _syncStream?: BaseMediaStream;
+    private _isPaused = false;
+    private _pausedFrames: Packet[] = [];
+    private _pauseStartTime?: number;
+    private _totalPausedTime = 0;
 
     constructor(type: string, noSleep = false) {
         super({ objectMode: true, highWaterMark: 0 });
         this._loggerSend = new Log(`stream:${type}:send`);
         this._loggerSync = new Log(`stream:${type}:sync`);
         this._loggerSleep = new Log(`stream:${type}:sleep`);
+        this._loggerPause = new Log(`stream:${type}:pause`);
         this._noSleep = noSleep;
     }
 
@@ -63,6 +69,69 @@ export class BaseMediaStream extends Writable {
             return;
         this._syncTolerance = n;
     }
+    get isPaused(): boolean {
+        return this._isPaused;
+    }
+
+    public pause(): void {
+        if (this._isPaused) {
+            this._loggerPause.debug("Stream already paused");
+            return;
+        }
+        
+        this._loggerPause.debug("Pausing stream");
+        this._isPaused = true;
+        this._pauseStartTime = performance.now();
+        
+        // Pause cork to prevent new writes from being processed
+        this.cork();
+    }
+
+    public resume(): void {
+        if (!this._isPaused) {
+            this._loggerPause.debug("Stream is not paused");
+            return;
+        }
+        
+        this._loggerPause.debug("Resuming stream");
+        
+        if (this._pauseStartTime) {
+            const pauseDuration = performance.now() - this._pauseStartTime;
+            this._totalPausedTime += pauseDuration;
+            this._loggerPause.debug(`Adding ${pauseDuration}ms to total paused time (total: ${this._totalPausedTime}ms)`);
+        }
+        
+        this._isPaused = false;
+        this._pauseStartTime = undefined;
+        
+        // Reset timing compensation to account for pause
+        this.resetTimingCompensation();
+        
+        // Uncork to allow writes to continue
+        this.uncork();
+        
+        // Process any frames that were queued during pause
+        this._processPausedFrames();
+    }
+
+    private _processPausedFrames(): void {
+        if (this._pausedFrames.length === 0) return;
+        
+        this._loggerPause.debug(`Processing ${this._pausedFrames.length} frames queued during pause`);
+        
+        const frames = [...this._pausedFrames];
+        this._pausedFrames = [];
+        
+        // Process frames asynchronously to avoid blocking
+        setImmediate(() => {
+            for (const frame of frames) {
+                if (!this._isPaused) {
+                    this._processFrame(frame);
+                }
+            }
+        });
+    }
+
     protected async _sendFrame(frame: Buffer, frametime: number): Promise<void>
     {
         throw new Error("Not implemented");
@@ -82,8 +151,10 @@ export class BaseMediaStream extends Writable {
     }
     private resetTimingCompensation() {
         this._startTime = this._startPts = undefined;
+        this._totalPausedTime = 0;
     }
-    async _write(frame: Packet, _: BufferEncoding, callback: (error?: Error | null) => void) {
+
+    private async _processFrame(frame: Packet): Promise<void> {
         const { data, ptshi, pts, durationhi, duration, time_base_num, time_base_den } = frame;
         // biome-ignore lint/style/noNonNullAssertion: this will never happen with our media stream
         const frametime = combineLoHi(durationhi!, duration!) / time_base_den! * time_base_num! * 1000;
@@ -117,12 +188,16 @@ export class BaseMediaStream extends Writable {
 
         this._startTime ??= start_sendFrame;
         this._startPts ??= this._pts;
+        
+        // Account for total paused time when calculating sleep
+        const adjustedElapsedTime = (end_sendFrame - this._startTime) - this._totalPausedTime;
         const sleep = Math.max(
-            0, this._pts - this._startPts + frametime - (end_sendFrame - this._startTime)
+            0, this._pts - this._startPts + frametime - adjustedElapsedTime
         );
+        
         if (this._noSleep || sleep === 0)
         {
-            callback(null);
+            return;
         }
         else if (this.sync && this.isBehind())
         {
@@ -133,7 +208,7 @@ export class BaseMediaStream extends Writable {
                 }
             }, "Stream is behind. Not sleeping for this frame");
             this.resetTimingCompensation();
-            callback(null);
+            return;
         }
         else if (this.sync && this.isAhead())
         {
@@ -148,9 +223,9 @@ export class BaseMediaStream extends Writable {
                 }, `Stream is ahead. Waiting for ${frametime}ms`);
                 await setTimeout(frametime);
             }
-            while (this.sync && this.isAhead());
+            while (this.sync && this.isAhead() && !this._isPaused);
             this.resetTimingCompensation();
-            callback(null);
+            return;
         }
         else
         {
@@ -160,14 +235,34 @@ export class BaseMediaStream extends Writable {
                     startPts: this._startPts,
                     time: end_sendFrame,
                     startTime: this._startTime,
-                    frametime
+                    frametime,
+                    totalPausedTime: this._totalPausedTime,
+                    adjustedSleep: sleep
                 }
-            }, `Sleeping for ${sleep}ms`);
-            setTimeout(sleep).then(() => callback(null));
+            }, `Sleeping for ${sleep}ms (paused time: ${this._totalPausedTime}ms)`);
+            await setTimeout(sleep);
         }
     }
+
+    async _write(frame: Packet, _: BufferEncoding, callback: (error?: Error | null) => void) {
+        if (this._isPaused) {
+            this._loggerPause.debug("Frame received while paused, queuing");
+            this._pausedFrames.push(frame);
+            callback(null);
+            return;
+        }
+
+        try {
+            await this._processFrame(frame);
+            callback(null);
+        } catch (error) {
+            callback(error as Error);
+        }
+    }
+
     _destroy(error: Error | null, callback: (error?: Error | null) => void): void {
         super._destroy(error, callback);
         this.syncStream = undefined;
+        this._pausedFrames = [];
     }
 }
