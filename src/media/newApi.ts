@@ -96,8 +96,198 @@ export type EncoderOptions = {
 
 export type Controller = {
     volume: number,
-    setVolume(newVolume: number): Promise<boolean>
+    setVolume(newVolume: number): Promise<boolean>,
+    isPaused: boolean,
+    pause(): Promise<void>,
+    resume(): Promise<void>,
+    stop(): void
 };
+
+type StreamState = {
+    input: string | Readable,
+    options: EncoderOptions,
+    cancelSignal?: AbortSignal,
+    isPaused: boolean,
+    isRunning: boolean,
+    currentCommand?: ffmpeg.FfmpegCommand,
+    currentOutput?: PassThrough,
+    currentPromise?: Promise<void>,
+    zmqAudioClient?: zmq.Request,
+    currentVolume: number,
+    logger: Log
+};
+
+function createFFmpegCommand(state: StreamState): {
+    command: ffmpeg.FfmpegCommand,
+    output: PassThrough,
+    promise: Promise<void>,
+    zmqAudioClient?: zmq.Request
+} {
+    const { input, options, cancelSignal, logger } = state;
+    const output = new PassThrough();
+
+    let isHttpUrl = false;
+    let isHls = false;
+
+    if (typeof input === "string") {
+        isHttpUrl = input.startsWith('http') || input.startsWith('https');
+        isHls = input.includes('m3u');
+    }
+
+    // command creation
+    const command = ffmpeg(input)
+        .addOption('-loglevel', '0')
+
+    // input options
+    const { hardwareAcceleratedDecoding, minimizeLatency, customHeaders } = options;
+    if (hardwareAcceleratedDecoding)
+        command.inputOption('-hwaccel', 'auto');
+
+    if (minimizeLatency) {
+        command.addOptions([
+            '-fflags nobuffer',
+            '-analyzeduration 0'
+        ])
+    }
+
+    if (isHttpUrl) {
+        command.inputOption('-headers',
+            Object.entries(customHeaders).map(([k, v]) => `${k}: ${v}`).join("\r\n")
+        );
+        if (!isHls) {
+            command.inputOptions([
+                '-reconnect 1',
+                '-reconnect_at_eof 1',
+                '-reconnect_streamed 1',
+                '-reconnect_delay_max 4294'
+            ]);
+        }
+    }
+
+    // general output options
+    command
+        .output(output)
+        .outputFormat("matroska");
+
+    // video setup
+    const {
+        noTranscoding, width, height, frameRate, bitrateVideo, bitrateVideoMax, videoCodec, h26xPreset
+    } = options;
+    command.addOutputOption("-map 0:v");
+
+    if (noTranscoding)
+    {
+        command.videoCodec("copy");
+    }
+    else
+    {
+        command.videoFilter(`scale=${width}:${height}`)
+
+        if (frameRate)
+            command.fpsOutput(frameRate);
+
+        command.addOutputOption([
+            "-b:v", `${bitrateVideo}k`,
+            "-maxrate:v", `${bitrateVideoMax}k`,
+            "-bf", "0",
+            "-pix_fmt", "yuv420p",
+            "-force_key_frames", "expr:gte(t,n_forced*1)"
+        ]);
+
+        switch (videoCodec) {
+            case 'AV1':
+                command
+                    .videoCodec("libsvtav1")
+                break;
+            case 'VP8':
+                command
+                    .videoCodec("libvpx")
+                    .outputOption('-deadline', 'realtime');
+                break;
+            case 'VP9':
+                command
+                    .videoCodec("libvpx-vp9")
+                    .outputOption('-deadline', 'realtime');
+                break;
+            case 'H264':
+                command
+                    .videoCodec("libx264")
+                    .outputOptions([
+                        '-tune zerolatency',
+                        `-preset ${h26xPreset}`,
+                        '-profile:v baseline',
+                    ]);
+                break;
+            case 'H265':
+                command
+                    .videoCodec("libx265")
+                    .outputOptions([
+                        '-tune zerolatency',
+                        `-preset ${h26xPreset}`,
+                        '-profile:v main',
+                    ]);
+                break;
+        }
+    }
+
+    // audio setup
+    const { includeAudio, bitrateAudio } = options;
+    let zmqAudioClient: zmq.Request | undefined;
+    
+    if (includeAudio) {
+        command
+            .addOutputOption("-map 0:a?")
+            .audioChannels(2)
+            .addOutputOption("-lfe_mix_level 1")
+            .audioFrequency(48000)
+            .audioCodec("libopus")
+            .audioBitrate(`${bitrateAudio}k`)
+            .audioFilters("volume@internal_lib=1.0")
+
+        // realtime control mechanism
+        const zmqAudio = "tcp://localhost:42069";
+        zmqAudioClient = new zmq.Request({ sendTimeout: 5000, receiveTimeout: 5000 });
+
+        command.audioFilters(`azmq=b=${zmqAudio.replaceAll(":","\\\\:")}`)
+        output.once("data", () => {
+            zmqAudioClient?.connect(zmqAudio);
+        });
+    }
+
+    // Add custom ffmpeg flags
+    if (options.customFfmpegFlags && options.customFfmpegFlags.length > 0) {
+        command.addOptions(options.customFfmpegFlags);
+    }
+
+    // exit handling
+    const promise = new Promise<void>((resolve, reject) => {
+        command.on("error", (err) => {
+            if (cancelSignal?.aborted) {
+                /**
+                 * fluent-ffmpeg might throw an error when SIGTERM is sent to
+                 * the process, so we check if the abort signal is triggered
+                 * and throw that instead
+                 */
+                reject(cancelSignal.reason);
+            } else if (state.isPaused) {
+                // If we're pausing, this is expected
+                logger.debug("FFmpeg stopped for pause");
+                resolve();
+            } else {
+                reject(err);
+            }
+        });
+        command.on("end", () => {
+            logger.debug("FFmpeg ended normally");
+            resolve();
+        });
+    });
+
+    promise.catch(() => {});
+    cancelSignal?.addEventListener("abort", () => command.kill("SIGTERM"), { once: true });
+
+    return { command, output, promise, zmqAudioClient };
+}
 
 export function prepareStream(
     input: string | Readable,
@@ -182,197 +372,167 @@ export function prepareStream(
     }
 
     const mergedOptions = mergeOptions(options);
+    const logger = new Log("prepareStream");
 
-    let isHttpUrl = false;
-    let isHls = false;
+    const state: StreamState = {
+        input,
+        options: mergedOptions,
+        cancelSignal,
+        isPaused: false,
+        isRunning: false,
+        currentVolume: 1,
+        logger
+    };
 
-    if (typeof input === "string") {
-        isHttpUrl = input.startsWith('http') || input.startsWith('https');
-        isHls = input.includes('m3u');
-    }
-
-    const output = new PassThrough();
-
-    // command creation
-    const command = ffmpeg(input)
-        .addOption('-loglevel', '0')
-
-    // input options
-    const { hardwareAcceleratedDecoding, minimizeLatency, customHeaders } = mergedOptions;
-    if (hardwareAcceleratedDecoding)
-        command.inputOption('-hwaccel', 'auto');
-
-    if (minimizeLatency) {
-        command.addOptions([
-            '-fflags nobuffer',
-            '-analyzeduration 0'
-        ])
-    }
-
-    if (isHttpUrl) {
-        command.inputOption('-headers',
-            Object.entries(customHeaders).map(([k, v]) => `${k}: ${v}`).join("\r\n")
-        );
-        if (!isHls) {
-            command.inputOptions([
-                '-reconnect 1',
-                '-reconnect_at_eof 1',
-                '-reconnect_streamed 1',
-                '-reconnect_delay_max 4294'
-            ]);
+    function startStream() {
+        if (state.isRunning || state.isPaused) {
+            logger.debug("Stream already running or paused, not starting");
+            return;
         }
+
+        logger.debug("Starting FFmpeg stream");
+        const { command, output, promise, zmqAudioClient } = createFFmpegCommand(state);
+        
+        state.currentCommand = command;
+        state.currentOutput = output;
+        state.currentPromise = promise;
+        state.zmqAudioClient = zmqAudioClient;
+        state.isRunning = true;
+
+        command.run();
+        
+        return { command, output, promise };
     }
 
-    // general output options
-    command
-        .output(output)
-        .outputFormat("matroska");
-
-    // video setup
-    const {
-        noTranscoding, width, height, frameRate, bitrateVideo, bitrateVideoMax, videoCodec, h26xPreset
-    } = mergedOptions;
-    command.addOutputOption("-map 0:v");
-
-    if (noTranscoding)
-    {
-        command.videoCodec("copy");
-    }
-    else
-    {
-        command.videoFilter(`scale=${width}:${height}`)
-
-        if (frameRate)
-            command.fpsOutput(frameRate);
-
-        command.addOutputOption([
-            "-b:v", `${bitrateVideo}k`,
-            "-maxrate:v", `${bitrateVideoMax}k`,
-            "-bf", "0",
-            "-pix_fmt", "yuv420p",
-            "-force_key_frames", "expr:gte(t,n_forced*1)"
-        ]);
-
-        switch (videoCodec) {
-            case 'AV1':
-                command
-                    .videoCodec("libsvtav1")
-                break;
-            case 'VP8':
-                command
-                    .videoCodec("libvpx")
-                    .outputOption('-deadline', 'realtime');
-                break;
-            case 'VP9':
-                command
-                    .videoCodec("libvpx-vp9")
-                    .outputOption('-deadline', 'realtime');
-                break;
-            case 'H264':
-                command
-                    .videoCodec("libx264")
-                    .outputOptions([
-                        '-tune zerolatency',
-                        `-preset ${h26xPreset}`,
-                        '-profile:v baseline',
-                    ]);
-                break;
-            case 'H265':
-                command
-                    .videoCodec("libx265")
-                    .outputOptions([
-                        '-tune zerolatency',
-                        `-preset ${h26xPreset}`,
-                        '-profile:v main',
-                    ]);
-                break;
+    async function pauseStream() {
+        if (state.isPaused || !state.isRunning) {
+            logger.debug("Stream already paused or not running");
+            return;
         }
+
+        logger.debug("Pausing stream");
+        state.isPaused = true;
+        
+        if (state.currentCommand) {
+            state.currentCommand.kill("SIGTERM");
+        }
+        
+        try {
+            await state.currentPromise;
+        } catch (error) {
+            // Expected when killing the process
+            logger.debug("FFmpeg process terminated for pause");
+        }
+        
+        state.isRunning = false;
+        state.currentCommand = undefined;
+        state.currentOutput = undefined;
+        state.currentPromise = undefined;
+        
+        if (state.zmqAudioClient) {
+            try {
+                state.zmqAudioClient.close();
+            } catch (error) {
+                logger.debug("Error closing ZMQ client:", error);
+            }
+            state.zmqAudioClient = undefined;
+        }
+        
+        logger.debug("Stream paused successfully");
     }
 
-    // audio setup
-    const { includeAudio, bitrateAudio } = mergedOptions;
-    if (includeAudio)
-        command
-            .addOutputOption("-map 0:a?")
-            .audioChannels(2)
-            /*
-             * I don't have much surround sound material to test this with,
-             * if you do and you have better settings for this, feel free to
-             * contribute!
-             */
-            .addOutputOption("-lfe_mix_level 1")
-            .audioFrequency(48000)
-            .audioCodec("libopus")
-            .audioBitrate(`${bitrateAudio}k`)
-            .audioFilters("volume@internal_lib=1.0")
+    async function resumeStream() {
+        if (!state.isPaused) {
+            logger.debug("Stream is not paused");
+            return;
+        }
 
-    // Add custom ffmpeg flags
-    if (mergedOptions.customFfmpegFlags && mergedOptions.customFfmpegFlags.length > 0) {
-        command.addOptions(mergedOptions.customFfmpegFlags);
+        logger.debug("Resuming stream");
+        state.isPaused = false;
+        startStream();
+        logger.debug("Stream resumed successfully");
     }
 
-    // realtime control mechanism
-    const zmqAudio = "tcp://localhost:42069";
-    const zmqAudioClient = new zmq.Request({ sendTimeout: 5000, receiveTimeout: 5000 });
-
-    if (includeAudio)
-    {
-        command.audioFilters(`azmq=b=${zmqAudio.replaceAll(":","\\\\:")}`)
-        output.once("data", () => {
-            zmqAudioClient.connect(zmqAudio);
-        });
+    function stopStream() {
+        logger.debug("Stopping stream");
+        state.isPaused = false;
+        state.isRunning = false;
+        
+        if (state.currentCommand) {
+            state.currentCommand.kill("SIGTERM");
+        }
+        
+        if (state.zmqAudioClient) {
+            try {
+                state.zmqAudioClient.close();
+            } catch (error) {
+                logger.debug("Error closing ZMQ client:", error);
+            }
+        }
+        
+        state.currentCommand = undefined;
+        state.currentOutput = undefined;
+        state.currentPromise = undefined;
+        state.zmqAudioClient = undefined;
+        
+        logger.debug("Stream stopped successfully");
     }
 
-    // Add custom ffmpeg flags
-    if (mergedOptions.customFfmpegFlags && mergedOptions.customFfmpegFlags.length > 0) {
-        command.addOptions(mergedOptions.customFfmpegFlags);
+    // Start the initial stream
+    const initial = startStream();
+    if (!initial) {
+        throw new Error("Failed to start initial stream");
     }
 
-    // exit handling
-    const promise = new Promise<void>((resolve, reject) => {
-        command.on("error", (err) => {
-            if (cancelSignal?.aborted)
-                /**
-                 * fluent-ffmpeg might throw an error when SIGTERM is sent to
-                 * the process, so we check if the abort signal is triggered
-                 * and throw that instead
-                 */
-                reject(cancelSignal.reason);
-            else
-                reject(err);
-        });
-        command.on("end", () => resolve());
-    })
-    promise.catch(() => {});
-    cancelSignal?.addEventListener("abort", () => command.kill("SIGTERM"), { once: true });
-    command.run();
-
-    let currentVolume = 1;
     return {
-        command,
-        output,
-        promise,
+        command: initial.command,
+        output: initial.output,
+        promise: initial.promise,
         controller: {
             get volume() {
-                return currentVolume;
+                return state.currentVolume;
             },
-            async setVolume(newVolume: number)
-            {
+            async setVolume(newVolume: number) {
                 if (newVolume < 0)
                     return false;
-                try
-                {
-                    await zmqAudioClient.send(`volume@internal_lib volume ${newVolume}`);
-                    const [res] = await zmqAudioClient.receive();
+                try {
+                    if (!state.zmqAudioClient || state.isPaused) {
+                        // Store the volume for when we resume
+                        state.currentVolume = newVolume;
+                        return true;
+                    }
+                    
+                    await state.zmqAudioClient.send(`volume@internal_lib volume ${newVolume}`);
+                    const [res] = await state.zmqAudioClient.receive();
                     if (res.toString("utf-8") !== "0 Error number 0 occurred")
                         return false;
-                    currentVolume = newVolume;
+                    state.currentVolume = newVolume;
                     return true;
-                }
-                catch
-                {
+                } catch {
                     return false;
                 }
+            },
+            get isPaused() {
+                return state.isPaused;
+            },
+            async pause() {
+                await pauseStream();
+            },
+            async resume() {
+                await resumeStream();
+                
+                // Restore volume after resume
+                if (state.zmqAudioClient && state.currentVolume !== 1) {
+                    try {
+                        await state.zmqAudioClient.send(`volume@internal_lib volume ${state.currentVolume}`);
+                        await state.zmqAudioClient.receive();
+                    } catch (error) {
+                        logger.debug("Failed to restore volume after resume:", error);
+                    }
+                }
+            },
+            stop() {
+                stopStream();
             }
         } satisfies Controller
     }
