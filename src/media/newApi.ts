@@ -2,9 +2,9 @@ import ffmpeg from 'fluent-ffmpeg';
 import pDebounce from 'p-debounce';
 import sharp from 'sharp';
 import Log from 'debug-level';
-import { demux } from './LibavDemuxer.js';
-import { setTimeout as delay } from 'node:timers/promises';
+import * as zmq from "zeromq";
 import { PassThrough, type Readable } from "node:stream";
+import { demux } from './LibavDemuxer.js';
 import { VideoStream } from './VideoStream.js';
 import { AudioStream } from './AudioStream.js';
 import { isFiniteNonZero } from '../utils.js';
@@ -94,6 +94,11 @@ export type EncoderOptions = {
     customFfmpegFlags: string[]
 }
 
+export type Controller = {
+    volume: number,
+    setVolume(newVolume: number): Promise<boolean>
+};
+
 export function prepareStream(
     input: string | Readable,
     options: Partial<EncoderOptions> = {},
@@ -128,45 +133,45 @@ export function prepareStream(
 
             width:
                 isFiniteNonZero(opts.width) ? Math.round(opts.width) : defaultOptions.width,
-    
+
             height:
                 isFiniteNonZero(opts.height) ? Math.round(opts.height) : defaultOptions.height,
-    
+
             frameRate:
                 isFiniteNonZero(opts.frameRate) && opts.frameRate > 0
                     ? opts.frameRate
                     : defaultOptions.frameRate,
-    
+
             videoCodec:
                 opts.videoCodec ?? defaultOptions.videoCodec,
-    
+
             bitrateVideo:
                 isFiniteNonZero(opts.bitrateVideo) && opts.bitrateVideo > 0
                     ? Math.round(opts.bitrateVideo)
                     : defaultOptions.bitrateVideo,
-    
+
             bitrateVideoMax:
                 isFiniteNonZero(opts.bitrateVideoMax) && opts.bitrateVideoMax > 0
                     ? Math.round(opts.bitrateVideoMax)
                     : defaultOptions.bitrateVideoMax,
-    
+
             bitrateAudio:
                 isFiniteNonZero(opts.bitrateAudio) && opts.bitrateAudio > 0
                     ? Math.round(opts.bitrateAudio)
                     : defaultOptions.bitrateAudio,
-    
+
             includeAudio:
                 opts.includeAudio ?? defaultOptions.includeAudio,
-    
+
             hardwareAcceleratedDecoding:
                 opts.hardwareAcceleratedDecoding ?? defaultOptions.hardwareAcceleratedDecoding,
-    
+
             minimizeLatency:
                 opts.minimizeLatency ?? defaultOptions.minimizeLatency,
-    
+
             h26xPreset:
                 opts.h26xPreset ?? defaultOptions.h26xPreset,
-    
+
             customHeaders: {
                 ...defaultOptions.customHeaders, ...opts.customHeaders
             },
@@ -298,7 +303,25 @@ export function prepareStream(
             .addOutputOption("-lfe_mix_level 1")
             .audioFrequency(48000)
             .audioCodec("libopus")
-            .audioBitrate(`${bitrateAudio}k`);
+            .audioBitrate(`${bitrateAudio}k`)
+            .audioFilters("volume@internal_lib=1.0")
+
+    // Add custom ffmpeg flags
+    if (mergedOptions.customFfmpegFlags && mergedOptions.customFfmpegFlags.length > 0) {
+        command.addOptions(mergedOptions.customFfmpegFlags);
+    }
+
+    // realtime control mechanism
+    const zmqAudio = "tcp://localhost:42069";
+    const zmqAudioClient = new zmq.Request({ sendTimeout: 5000, receiveTimeout: 5000 });
+
+    if (includeAudio)
+    {
+        command.audioFilters(`azmq=b=${zmqAudio.replaceAll(":","\\\\:")}`)
+        output.once("data", () => {
+            zmqAudioClient.connect(zmqAudio);
+        });
+    }
 
     // Add custom ffmpeg flags
     if (mergedOptions.customFfmpegFlags && mergedOptions.customFfmpegFlags.length > 0) {
@@ -323,8 +346,36 @@ export function prepareStream(
     promise.catch(() => {});
     cancelSignal?.addEventListener("abort", () => command.kill("SIGTERM"), { once: true });
     command.run();
-    
-    return { command, output, promise }
+
+    let currentVolume = 1;
+    return {
+        command,
+        output,
+        promise,
+        controller: {
+            get volume() {
+                return currentVolume;
+            },
+            async setVolume(newVolume: number)
+            {
+                if (newVolume < 0)
+                    return false;
+                try
+                {
+                    await zmqAudioClient.send(`volume@internal_lib volume ${newVolume}`);
+                    const [res] = await zmqAudioClient.receive();
+                    if (res.toString("utf-8") !== "0 Error number 0 occurred")
+                        return false;
+                    currentVolume = newVolume;
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+        } satisfies Controller
+    }
 }
 
 export type PlayStreamOptions = {
@@ -465,17 +516,16 @@ export async function playStream(
         const aStream = new AudioStream(udp);
         audio.stream.pipe(aStream);
         vStream.syncStream = aStream;
-        aStream.syncStream = vStream;
 
         const burstTime = mergedOptions.readrateInitialBurst;
         if (typeof burstTime === "number")
         {
-            vStream.sync = aStream.sync = false;
+            vStream.sync = false;
             vStream.noSleep = aStream.noSleep = true;
             const stopBurst = (pts: number) => {
                 if (pts < burstTime * 1000)
                     return;
-                vStream.sync = aStream.sync = true;
+                vStream.sync = true;
                 vStream.noSleep = aStream.noSleep = false;
                 vStream.off("pts", stopBurst);
             }
