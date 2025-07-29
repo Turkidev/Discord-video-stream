@@ -10,18 +10,27 @@ export class BaseMediaStream extends Writable {
     private _loggerSend: Log;
     private _loggerSync: Log;
     private _loggerSleep: Log;
+    private _loggerSeek: Log;
 
     private _noSleep: boolean;
     private _startTime?: number;
     private _startPts?: number;
     private _sync = true;
     private _syncStream?: BaseMediaStream;
+    
+    // New properties for seeking
+    private _seekOffset = 0;
+    private _isSeeking = false;
+    private _seekTarget?: number;
+    private _virtualPts = 0;
+    private _lastRealPts = 0;
 
     constructor(type: string, noSleep = false) {
         super({ objectMode: true, highWaterMark: 0 });
         this._loggerSend = new Log(`stream:${type}:send`);
         this._loggerSync = new Log(`stream:${type}:sync`);
         this._loggerSleep = new Log(`stream:${type}:sleep`);
+        this._loggerSeek = new Log(`stream:${type}:seek`);
         this._noSleep = noSleep;
     }
 
@@ -83,29 +92,66 @@ export class BaseMediaStream extends Writable {
     private resetTimingCompensation() {
         this._startTime = this._startPts = undefined;
     }
+    public seek(targetPts: number) {
+        this._loggerSeek.debug({ targetPts }, "Seeking to position");
+        this._isSeeking = true;
+        this._seekTarget = targetPts;
+        this._seekOffset = targetPts - (this._lastRealPts || 0);
+        this.resetTimingCompensation();
+    }
+
     async _write(frame: Packet, _: BufferEncoding, callback: (error?: Error | null) => void) {
         const { data, ptshi, pts, durationhi, duration, time_base_num, time_base_den } = frame;
-        // biome-ignore lint/style/noNonNullAssertion: this will never happen with our media stream
         const frametime = combineLoHi(durationhi!, duration!) / time_base_den! * time_base_num! * 1000;
+        
+        // Calculate real PTS
+        const realPts = combineLoHi(ptshi!, pts!) / time_base_den! * time_base_num! * 1000;
+        this._lastRealPts = realPts;
+
+        // Handle seeking
+        if (this._isSeeking && this._seekTarget !== undefined) {
+            // Skip frames until we reach the seek target
+            if (realPts < this._seekTarget) {
+                this._loggerSeek.trace({ realPts, seekTarget: this._seekTarget }, "Skipping frame during seek");
+                callback(null);
+                return;
+            }
+            // We've reached the seek target
+            this._isSeeking = false;
+            this._seekTarget = undefined;
+            this._loggerSeek.debug({ realPts }, "Seek completed");
+        }
+
+        // Calculate virtual PTS (what Discord thinks is the current position)
+        this._virtualPts += frametime;
+        this._pts = this._virtualPts;
 
         const start_sendFrame = performance.now();
         await this._sendFrame(Buffer.from(data), frametime);
         const end_sendFrame = performance.now();
 
-        // biome-ignore lint/style/noNonNullAssertion: this will never happen with our media stream
-        this._pts = combineLoHi(ptshi!, pts!) / time_base_den! * time_base_num! * 1000;
         this.emit("pts", this._pts);
 
+        // Rest of the timing logic remains the same...
         const sendTime = end_sendFrame - start_sendFrame;
         const ratio = sendTime / frametime;
         this._loggerSend.debug({
             stats: {
                 pts: this._pts,
+                realPts,
+                virtualPts: this._virtualPts,
                 frame_size: data.length,
                 duration: sendTime,
                 frametime
             }
         }, `Frame sent in ${sendTime.toFixed(2)}ms (${(ratio * 100).toFixed(2)}% frametime)`);
+
+        // Sleep calculations use virtual PTS
+        this._startTime ??= start_sendFrame;
+        this._startPts ??= this._virtualPts;
+        const sleep = Math.max(
+            0, this._virtualPts - this._startPts + frametime - (end_sendFrame - this._startTime)
+        );
         if (ratio > 1)
         {
             this._loggerSend.warn({
