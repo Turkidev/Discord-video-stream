@@ -3,17 +3,19 @@ import pDebounce from 'p-debounce';
 import sharp from 'sharp';
 import Log from 'debug-level';
 import * as zmq from "zeromq";
-import { PassThrough, type Readable } from "node:stream";
+import { PassThrough, Transform, type Readable } from "node:stream";
 import { demux } from './LibavDemuxer.js';
 import { VideoStream } from './VideoStream.js';
 import { AudioStream } from './AudioStream.js';
 import { isFiniteNonZero } from '../utils.js';
 import { AVCodecID } from './LibavCodecId.js';
 import { createDecoder } from './LibavDecoder.js';
+import { combineLoHi } from './utils.js';
 
 import LibAV from '@lng2004/libav.js-variant-webcodecs-avf-with-decoders';
 import type { SupportedVideoCodec } from '../utils.js';
 import type { MediaUdp, Streamer } from '../client/index.js';
+import type { Packet } from '@lng2004/libav.js-variant-webcodecs-avf-with-decoders';
 
 export type EncoderOptions = {
     /**
@@ -98,6 +100,54 @@ export type Controller = {
     volume: number,
     setVolume(newVolume: number): Promise<boolean>
 };
+
+// Seekable Stream Controller for enhanced functionality
+class SeekableStreamController extends Transform {
+    private keyFramePositions: number[] = [];
+    private currentPts = 0;
+    private seekTarget?: number;
+    private isSeeking = false;
+    
+    constructor() {
+        super({ objectMode: true });
+    }
+    
+    _transform(packet: Packet, encoding: string, callback: Function) {
+        const pts = combineLoHi(packet.ptshi!, packet.pts!) / 
+                   packet.time_base_den! * packet.time_base_num! * 1000;
+        
+        this.currentPts = pts;
+        
+        // Track keyframes
+        const isKeyFrame = (packet.flags !== undefined && packet.flags & 0x0001) !== 0;
+        if (isKeyFrame) {
+            this.keyFramePositions.push(pts);
+        }
+        
+        // Handle seeking
+        if (this.isSeeking && this.seekTarget !== undefined) {
+            if (pts < this.seekTarget) {
+                // Skip frames until we reach the seek target
+                callback();
+                return;
+            }
+            this.isSeeking = false;
+            this.seekTarget = undefined;
+        }
+        
+        callback(null, packet);
+    }
+    
+    seek(targetMs: number) {
+        this.seekTarget = targetMs;
+        this.isSeeking = true;
+        this.emit('seek', targetMs);
+    }
+    
+    getCurrentPosition() {
+        return this.currentPts;
+    }
+}
 
 export function prepareStream(
     input: string | Readable,
@@ -373,6 +423,61 @@ export function prepareStream(
     }
 }
 
+// Enhanced prepareStream with seek support
+export function prepareSeekableStream(
+    input: string,
+    options: Partial<EncoderOptions> = {},
+    cancelSignal?: AbortSignal
+) {
+    if (typeof input !== 'string') {
+        throw new Error('Seekable streams require a file path or URL input');
+    }
+
+    let currentCommand: ffmpeg.FfmpegCommand | null = null;
+    const output = new PassThrough();
+    let startTime = 0;
+
+    const createCommand = (seekTime = 0) => {
+        // Kill previous command if exists
+        if (currentCommand) {
+            currentCommand.kill('SIGTERM');
+        }
+
+        startTime = seekTime;
+        const { command, controller } = prepareStream(input, options, cancelSignal);
+        
+        // Add seek input option
+        command.seekInput(seekTime / 1000);
+        
+        currentCommand = command;
+        return { command, controller };
+    };
+
+    // Start initial stream
+    const { controller: initialController } = createCommand(0);
+
+    const seekController = {
+        ...initialController,
+        async seek(timeMs: number) {
+            const { controller } = createCommand(timeMs);
+            // Transfer the current volume setting
+            if (initialController.volume !== 1) {
+                await controller.setVolume(initialController.volume);
+            }
+            return controller;
+        },
+        getCurrentTime() {
+            return startTime;
+        }
+    };
+
+    return {
+        command: currentCommand!,
+        output,
+        controller: seekController
+    };
+}
+
 export type PlayStreamOptions = {
     /**
      * Set stream type as "Go Live" or camera stream
@@ -413,11 +518,19 @@ export type PlayStreamOptions = {
     streamPreview: boolean,
 }
 
+export type StreamController = {
+    seek(timeMs: number): Promise<void>;
+    getCurrentPosition(): number;
+    pause(): void;
+    resume(): void;
+    isPaused(): boolean;
+}
+
 export async function playStream(
     input: Readable, streamer: Streamer,
     options: Partial<PlayStreamOptions> = {},
     cancelSignal?: AbortSignal
-)
+): Promise<void>
 {
     const logger = new Log("playStream");
     cancelSignal?.throwIfAborted();
@@ -594,4 +707,203 @@ export async function playStream(
             resolve();
         });
     }).catch(() => {});
+}
+
+// New enhanced playStream with seek support
+export async function playSeekableStream(
+    input: string | Readable,
+    streamer: Streamer,
+    options: Partial<PlayStreamOptions> = {},
+    cancelSignal?: AbortSignal
+): Promise<StreamController> {
+    const logger = new Log("playSeekableStream");
+    cancelSignal?.throwIfAborted();
+    
+    if (!streamer.voiceConnection)
+        throw new Error("Bot is not connected to a voice channel");
+
+    // Create seekable stream controllers
+    const videoSeekController = new SeekableStreamController();
+    const audioSeekController = new SeekableStreamController();
+    
+    let isPaused = false;
+    let currentPosition = 0;
+    
+    // If input is a string, we can support seeking by restarting FFmpeg
+    let seekableInput: Readable;
+    let ffmpegSeekHandler: ((timeMs: number) => Promise<void>) | undefined;
+    
+    if (typeof input === 'string') {
+        // Create a seekable FFmpeg stream
+        const output = new PassThrough();
+        let currentCommand: ffmpeg.FfmpegCommand | null = null;
+        
+        const createSeekableCommand = (seekTime = 0) => {
+            if (currentCommand) {
+                currentCommand.kill('SIGTERM');
+            }
+            
+            const { command } = prepareStream(input, options, cancelSignal);
+            command.seekInput(seekTime / 1000);
+            command.pipe(output, { end: false });
+            currentCommand = command;
+        };
+        
+        createSeekableCommand(0);
+        seekableInput = output;
+        
+        ffmpegSeekHandler = async (timeMs: number) => {
+            logger.debug({ timeMs }, "FFmpeg seeking to position");
+            createSeekableCommand(timeMs);
+        };
+    } else {
+        seekableInput = input;
+    }
+
+    logger.debug("Initializing demuxer");
+    const { video, audio } = await demux(seekableInput);
+    cancelSignal?.throwIfAborted();
+
+    if (!video)
+        throw new Error("No video stream in media");
+
+    const cleanupFuncs: (() => unknown)[] = [];
+    const videoCodecMap: Record<number, SupportedVideoCodec> = {
+        [AVCodecID.AV_CODEC_ID_H264]: "H264",
+        [AVCodecID.AV_CODEC_ID_H265]: "H265",
+        [AVCodecID.AV_CODEC_ID_VP8]: "VP8",
+        [AVCodecID.AV_CODEC_ID_VP9]: "VP9",
+        [AVCodecID.AV_CODEC_ID_AV1]: "AV1"
+    };
+
+    const defaultOptions = {
+        type: "go-live",
+        width: video.width,
+        height: video.height,
+        frameRate: video.framerate_num / video.framerate_den,
+        readrateInitialBurst: undefined,
+        streamPreview: false,
+    } satisfies PlayStreamOptions;
+
+    function mergeOptions(opts: Partial<PlayStreamOptions>) {
+        return {
+            type: opts.type ?? defaultOptions.type,
+            width: isFiniteNonZero(opts.width) && opts.width > 0
+                ? Math.round(opts.width)
+                : defaultOptions.width,
+            height: isFiniteNonZero(opts.height) && opts.height > 0
+                ? Math.round(opts.height)
+                : defaultOptions.height,
+            frameRate: Math.round(
+                isFiniteNonZero(opts.frameRate) && opts.frameRate > 0
+                    ? Math.round(opts.frameRate)
+                    : defaultOptions.frameRate
+            ),
+            readrateInitialBurst: isFiniteNonZero(opts.readrateInitialBurst) && opts.readrateInitialBurst > 0
+                ? opts.readrateInitialBurst
+                : defaultOptions.readrateInitialBurst,
+            streamPreview: opts.streamPreview ?? defaultOptions.streamPreview,
+        } satisfies PlayStreamOptions;
+    }
+
+    const mergedOptions = mergeOptions(options);
+    logger.debug({ options: mergedOptions }, "Merged options");
+
+    let udp: MediaUdp;
+    let stopStream: () => unknown;
+    if (mergedOptions.type === "go-live") {
+        udp = await streamer.createStream();
+        stopStream = () => streamer.stopStream();
+    } else {
+        udp = streamer.voiceConnection.udp;
+        streamer.signalVideo(true);
+        stopStream = () => streamer.signalVideo(false);
+    }
+    
+    udp.setPacketizer(videoCodecMap[video.codec]);
+    udp.mediaConnection.setSpeaking(true);
+    udp.mediaConnection.setVideoAttributes(true, {
+        width: mergedOptions.width,
+        height: mergedOptions.height,
+        fps: mergedOptions.frameRate
+    });
+
+    const vStream = new VideoStream(udp);
+    const aStream = audio ? new AudioStream(udp) : undefined;
+
+    // Pipe through seek controllers
+    video.stream.pipe(videoSeekController).pipe(vStream);
+    if (audio && aStream) {
+        audio.stream.pipe(audioSeekController).pipe(aStream);
+        vStream.syncStream = aStream;
+    }
+
+    // Track current position
+    videoSeekController.on('data', (packet: Packet) => {
+        currentPosition = videoSeekController.getCurrentPosition();
+    });
+
+    // Handle seek events
+    if (ffmpegSeekHandler) {
+        videoSeekController.on('seek', ffmpegSeekHandler);
+        audioSeekController.on('seek', ffmpegSeekHandler);
+    }
+
+    // Stream controller
+    const controller: StreamController = {
+        async seek(timeMs: number) {
+            logger.debug({ timeMs }, "Seeking to position");
+            videoSeekController.seek(timeMs);
+            if (audio) {
+                audioSeekController.seek(timeMs);
+            }
+        },
+        getCurrentPosition() {
+            return currentPosition;
+        },
+        pause() {
+            isPaused = true;
+            vStream.pause();
+            aStream?.pause();
+        },
+        resume() {
+            isPaused = false;
+            vStream.resume();
+            aStream?.resume();
+        },
+        isPaused() {
+            return isPaused;
+        }
+    };
+
+    // Handle cleanup
+    const cleanup = new Promise<void>((resolve, reject) => {
+        cleanupFuncs.push(() => {
+            stopStream();
+            udp.mediaConnection.setSpeaking(false);
+            udp.mediaConnection.setVideoAttributes(false);
+        });
+        
+        let cleanedUp = false;
+        const doCleanup = () => {
+            if (cleanedUp) return;
+            cleanedUp = true;
+            for (const f of cleanupFuncs) f();
+        };
+
+        cancelSignal?.addEventListener("abort", () => {
+            doCleanup();
+            reject(cancelSignal.reason);
+        }, { once: true });
+
+        vStream.once("finish", () => {
+            if (cancelSignal?.aborted) return;
+            doCleanup();
+            resolve();
+        });
+    });
+
+    cleanup.catch(() => {});
+    
+    return controller;
 }
